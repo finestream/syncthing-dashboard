@@ -105,14 +105,42 @@ class SyncthingClient:
 
 
 def _int(value: Any) -> int:
+    """Syncthing reports counters as numbers, but be lenient with missing or odd values."""
     try:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
 
 
+def _folder_status(st: dict[str, Any], paused: bool) -> FolderStatus:
+    """Reduce ``/rest/db/status`` to what the page shows."""
+    need_items = sum(_int(st.get(k)) for k in ("needFiles", "needDirectories", "needSymlinks", "needDeletes"))
+    return FolderStatus(
+        state="paused" if paused else (st.get("state") or "unknown"),
+        global_bytes=_int(st.get("globalBytes")),
+        need_bytes=_int(st.get("needBytes")),
+        need_items=need_items,
+        errors=_int(st.get("errors")) + _int(st.get("pullErrors")),
+        error=st.get("error") or "",
+    )
+
+
+def _completion(c: dict[str, Any]) -> Completion:
+    """Reduce ``/rest/db/completion`` to what the page shows."""
+    return Completion(
+        completion=float(c.get("completion") or 0.0),
+        need_items=_int(c.get("needItems")) + _int(c.get("needDeletes")),
+        need_bytes=_int(c.get("needBytes")),
+        remote_state=c.get("remoteState") or "",
+    )
+
+
 def collect_host(host: HostConfig, timeout: float = 5.0) -> HostSnapshot:
-    """Collect everything the page needs from one host."""
+    """Collect everything the page needs from one host.
+
+    The first four calls decide whether the host counts as reachable. Everything
+    after that is best effort: a failure is logged and leaves a gap in the page.
+    """
     snap = HostSnapshot(name=host.name, url=host.url)
     client = SyncthingClient(host, timeout=timeout)
     try:
@@ -156,7 +184,7 @@ def collect_host(host: HostConfig, timeout: float = 5.0) -> HostSnapshot:
             "clientVersion": conn.get("clientVersion", ""),
         }
 
-    # Optional calls: a failure here degrades the page, it does not hide the host.
+    # Best effort from here on.
     try:
         errors = client.get("/rest/system/error")
         snap.system_errors = len(errors.get("errors") or [])
@@ -174,20 +202,7 @@ def collect_host(host: HostConfig, timeout: float = 5.0) -> HostSnapshot:
     for folder_id, folder in snap.folders.items():
         try:
             st = client.get("/rest/db/status", folder=folder_id)
-            need_items = (
-                _int(st.get("needFiles"))
-                + _int(st.get("needDirectories"))
-                + _int(st.get("needSymlinks"))
-                + _int(st.get("needDeletes"))
-            )
-            snap.folder_status[folder_id] = FolderStatus(
-                state="paused" if folder["paused"] else (st.get("state") or "unknown"),
-                global_bytes=_int(st.get("globalBytes")),
-                need_bytes=_int(st.get("needBytes")),
-                need_items=need_items,
-                errors=_int(st.get("errors")) + _int(st.get("pullErrors")),
-                error=st.get("error") or "",
-            )
+            snap.folder_status[folder_id] = _folder_status(st, folder["paused"])
         except RestError as exc:
             log.info("host %s folder %s: %s", host.name, folder_id, exc)
             snap.folder_status[folder_id] = FolderStatus("unknown", 0, 0, 0, 0, str(exc))
@@ -196,15 +211,9 @@ def collect_host(host: HostConfig, timeout: float = 5.0) -> HostSnapshot:
                 continue
             try:
                 c = client.get("/rest/db/completion", folder=folder_id, device=dev_id)
+                snap.completion[(folder_id, dev_id)] = _completion(c)
             except RestError as exc:
                 log.info("host %s folder %s device %s: %s", host.name, folder_id, dev_id[:7], exc)
-                continue
-            snap.completion[(folder_id, dev_id)] = Completion(
-                completion=float(c.get("completion") or 0.0),
-                need_items=_int(c.get("needItems")) + _int(c.get("needDeletes")),
-                need_bytes=_int(c.get("needBytes")),
-                remote_state=c.get("remoteState") or "",
-            )
     return snap
 
 

@@ -2,8 +2,8 @@
 # compose mounts each secret there.
 services:
   syncthing-dashboard:
-    build: .
-    # image: ghcr.io/finestream/syncthing-dashboard:latest
+    image: ghcr.io/finestream/syncthing-dashboard:latest
+    # build: .   # to build locally instead
     restart: unless-stopped
     ports:
       - "8080:8080"

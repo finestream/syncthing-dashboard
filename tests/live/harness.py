@@ -98,6 +98,11 @@ def wait_for(name: str, what: str, pred, timeout: float = 60.0) -> None:
 def generate(name: str) -> str:
     subprocess.run([BIN, "generate", "--home", str(home(name)), "--no-port-probing"], check=True, env=env(),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The GUI listens on loopback and would reject other Host headers (e.g. host.docker.internal
+    # from a container). Set in the file before the first start: over REST it restarts the GUI.
+    config = home(name) / "config.xml"
+    config.write_text(config.read_text().replace(
+        "</gui>", "    <insecureSkipHostcheck>true</insecureSkipHostcheck>\n    </gui>", 1))
     out = subprocess.run([BIN, "device-id", "--home", str(home(name))], check=True, env=env(),
                          capture_output=True, text=True).stdout
     return out.strip().split()[-1]
@@ -129,10 +134,6 @@ def configure(ids: dict[str, str]) -> None:
             "reconnectionIntervalS": 2,
         })
         rest(name, "PUT", "/rest/config/options", options)
-        # the GUI listens on loopback; allow other Host headers (e.g. host.docker.internal from a container)
-        gui = rest(name, "GET", "/rest/config/gui")
-        gui["insecureSkipHostcheck"] = True
-        rest(name, "PUT", "/rest/config/gui", gui)
         # drop any default folder
         for folder in rest(name, "GET", "/rest/config/folders"):
             rest(name, "DELETE", f"/rest/config/folders/{folder['id']}")
@@ -175,6 +176,11 @@ def in_sync(name: str, folder_id: str) -> bool:
     return st.get("state") == "idle" and st.get("needTotalItems", st.get("needFiles", 0)) == 0 and st.get("globalFiles", 0) > 0
 
 
+def peer_complete(name: str, folder_id: str, peer_id: str) -> bool:
+    c = rest(name, "GET", f"/rest/db/completion?folder={folder_id}&device={peer_id}")
+    return c.get("completion") == 100 and c.get("needItems", 0) == 0
+
+
 def up() -> None:
     if (RUN_DIR / "pids.json").exists():
         down()
@@ -201,6 +207,11 @@ def up() -> None:
                 wait_for(a, f"connection to {b}", lambda a=a, b=b: connected(a, ids[b]), timeout=90)
     for name, members in (("alpha", "shared-all"), ("beta", "shared-all"), ("gamma", "shared-all"), ("beta", "pair-ab"), ("gamma", "beta-gamma")):
         wait_for(name, f"{members} in sync", lambda name=name, members=members: in_sync(name, members), timeout=120)
+    # The peers must have received the stopped host's final index before it goes away,
+    # otherwise they report its copy as incomplete ("last known" on the page).
+    for name, folder_id in (("alpha", "shared-all"), ("beta", "shared-all"), ("beta", "beta-gamma")):
+        wait_for(name, f"{STOPPED} complete for {folder_id}",
+                 lambda name=name, folder_id=folder_id: peer_complete(name, folder_id, ids[STOPPED]), timeout=120)
     # stop one instance so the page shows an unreachable host
     os.killpg(procs[STOPPED].pid, signal.SIGTERM)
     procs[STOPPED].wait(timeout=30)

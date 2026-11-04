@@ -34,6 +34,23 @@ class RenderTest(unittest.TestCase):
         self.assertIn('class="cell flag"', self.html)
         self.assertIn("as seen by nas", self.html)
 
+    def test_state_colours_apply(self):
+        # Regression: a base rule more specific than ".cell.<state>" hid every state colour.
+        css = self.html.split("<style>")[1].split("</style>")[0]
+        self.assertIn("\n.matrix .cell { border-left: 5px", css)
+        for category in ("ok", "syncing", "scanning", "error", "paused", "offline", "flag"):
+            self.assertIn(f"\n.matrix .cell.{category} {{ border-left-color: var(--{category})", css)
+        # nothing more specific than ".matrix .cell" may touch a td's border
+        self.assertNotRegex(css, r"\n(\.[a-z-]+ ){2,}td[^{]*\{[^}]*border")
+        for category in ("ok", "error", "paused", "offline"):
+            self.assertIn(f".node.{category} circle {{ fill:", css)
+
+    def test_links_to_gui(self):
+        self.assertIn('<a href="https://nas.example.internal:8384" title="Open the Syncthing GUI">nas', self.html)
+        # column header of a monitored device links, an unmonitored one does not
+        self.assertIn('<th><a href="http://192.0.2.10:8384" title="Open the Syncthing GUI">laptop</a>', self.html)
+        self.assertIn("<th>Phone<span", self.html)
+
     def test_escaping(self):
         hosts = fx.all_hosts()
         hosts[0].devices[fx.PHONE]["name"] = '<img src=x onerror="alert(1)">'
