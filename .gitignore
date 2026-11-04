@@ -1,0 +1,22 @@
+# Real configuration and secrets never go into git
+hosts.toml
+*.pem
+*.crt
+*.key
+secrets/
+
+# Generated output
+overview.html
+*.html
+!tests/fixtures/*.html
+
+# Live test instances
+tests/live/run/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.egg-info/
