@@ -21,15 +21,22 @@ tool polls each instance's REST API and merges the answers into one page.
 
 - **Host strip** — one card per configured host: reachable or not, version,
   connected peers, number of folders, errors, and folders that were offered to
-  it but not accepted.
-- **Topology** — devices as nodes, an edge where a host shares at least one
+  it but not accepted. The host name links to its Syncthing GUI.
+- **Topology** — devices as nodes coloured by status (green reachable or
+  connected, red unreachable, grey not connected, yellow paused; unmonitored
+  devices have a dashed outline), an edge where a host shares at least one
   folder with another device; the edge label is the number of folders, the
   colour the connection state. Hover an edge for the folder names, a node for
   its device ID and version.
-- **Folders × devices** — rows are folders, columns are devices. A cell shows
-  the state (idle, syncing, scanning, error, paused, out of sync), completion
-  percent and items still needed. A folder **offered to a monitored host that
-  has not accepted it** is flagged orange.
+- **Folders × devices** — rows are folders, columns are devices (monitored
+  ones link to their GUI). A cell shows the state (idle, syncing, scanning,
+  error, paused, out of sync), completion percent and items still needed. A
+  folder **offered to a monitored host that has not accepted it** is flagged
+  orange.
+
+The links open the Syncthing GUI's own login. The API key cannot log a browser
+in: Syncthing accepts it only in a request header (`X-API-Key` or
+`Authorization: Bearer`), which a link cannot carry.
 
 Devices that appear in a host's configuration but are not in `hosts.toml`
 (phones, tablets, guests) are shown as *unmonitored* nodes with the state the
@@ -114,14 +121,19 @@ option to skip verification.
 
 ## Container
 
-`Dockerfile` builds a small image on `python:3.13-alpine` that runs
-`--serve 8080` as an unprivileged user. `compose.yaml` is an example stack
-that mounts `hosts.toml` read-only and passes the API keys as compose secrets:
+The image `ghcr.io/finestream/syncthing-dashboard` is built by GitHub Actions
+(`.github/workflows/ci.yml`) for `linux/amd64` and `linux/arm64`: `latest`
+follows `main`, a tag `v1.2.3` publishes `1.2.3`, `1.2` and `1`, and every
+build also gets a `sha-…` tag. It runs `--serve 8080` as an unprivileged user
+on `python:3.13-alpine`; `docker build .` builds the same image locally.
+
+`compose.yaml` is an example stack that mounts `hosts.toml` read-only and
+passes the API keys as compose secrets:
 
 ```yaml
 services:
   syncthing-dashboard:
-    build: .
+    image: ghcr.io/finestream/syncthing-dashboard:latest
     ports: ["8080:8080"]
     volumes:
       - ./hosts.toml:/config/hosts.toml:ro
@@ -137,7 +149,7 @@ secrets:
 With this layout `hosts.toml` uses `api_key_file = "/run/secrets/syncthing_nas"`.
 
 ```sh
-docker compose up -d --build
+docker compose up -d
 ```
 
 ## How it works

@@ -1,7 +1,9 @@
 """Merge the per-host snapshots into one picture of the network.
 
-Device IDs are the identity; names come from ``hosts.toml`` for monitored
-hosts and from the other hosts' configurations for everything else.
+Device IDs are the identity. A reachable host is the device whose ID it
+reports; an unreachable host is found by its name in a peer's device list.
+Every other device a host lists is *unmonitored*: it is shown with what the
+monitored hosts report about it.
 """
 
 from __future__ import annotations
@@ -10,9 +12,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .collector import HostSnapshot
+from .collector import FolderStatus, HostSnapshot
 
-# Syncthing folder states -> page categories (CSS classes)
+# Syncthing folder state -> page category. Categories are the CSS classes of the page.
 _STATE_CATEGORY = {
     "idle": "ok",
     "scanning": "scanning",
@@ -24,7 +26,6 @@ _STATE_CATEGORY = {
     "clean-waiting": "syncing",
     "error": "error",
     "paused": "paused",
-    "unknown": "unknown",
 }
 
 
@@ -32,13 +33,14 @@ _STATE_CATEGORY = {
 class Device:
     id: str
     name: str
-    monitored: bool
-    reachable: bool | None = None  # None for unmonitored devices
-    host_name: str | None = None
+    monitored: bool  # listed in hosts.toml
+    reachable: bool | None = None  # monitored devices only
+    host_name: str | None = None  # name in hosts.toml, monitored devices only
+    url: str = ""  # GUI address, monitored devices only
     version: str = ""
-    connected: bool = False  # some monitored host is connected to it
-    paused: bool = False  # paused on every monitored host that knows it
-    error: str = ""
+    connected: bool = False  # at least one reachable host is connected to it
+    paused: bool = False  # paused on every reachable host that knows it
+    error: str = ""  # why the host is unreachable
     folder_count: int = 0
 
     @property
@@ -60,19 +62,19 @@ class Device:
 
 @dataclass
 class Edge:
-    a: str  # device ID
+    a: str  # device IDs
     b: str
-    folders: list[str]  # folder IDs
+    folders: list[str]  # folder IDs, sorted by label
     state: str  # connected, disconnected, paused, unknown
 
 
 @dataclass
 class Cell:
-    state: str  # human readable: idle, syncing, scanning, error, paused, out of sync, not accepted, ...
-    category: str  # ok, syncing, scanning, error, paused, unknown, offline, flag
-    completion: float | None = None
+    state: str  # shown in the cell: idle, syncing, out of sync, not accepted, ...
+    category: str  # ok, syncing, scanning, error, paused, offline, flag, unknown
+    completion: float | None = None  # percent
     need_items: int | None = None
-    detail: str = ""
+    detail: str = ""  # tooltip
     flagged: bool = False  # offered to a monitored host that has not accepted it
 
 
@@ -81,172 +83,157 @@ class Folder:
     id: str
     label: str
     type: str = ""
-    devices: list[str] = field(default_factory=list)  # device IDs, in page order
+    devices: list[str] = field(default_factory=list)  # device IDs that have or were offered it, page order
 
 
 @dataclass
 class Overview:
     generated_at: datetime
     hosts: list[HostSnapshot]
-    devices: list[Device]
+    devices: list[Device]  # monitored hosts in configuration order, then the rest by name
     edges: list[Edge]
-    folders: list[Folder]
-    cells: dict[tuple[str, str], Cell]
-    # monitored hosts for which no device ID could be found (unreachable and never named elsewhere)
-    unplaced_hosts: list[str] = field(default_factory=list)
+    folders: list[Folder]  # by label
+    cells: dict[tuple[str, str], Cell]  # (folder ID, device ID) -> cell
+    unplaced_hosts: list[str] = field(default_factory=list)  # unreachable hosts with no device ID
 
     def device(self, device_id: str) -> Device:
         return next(d for d in self.devices if d.id == device_id)
 
 
-def _percent(global_bytes: int, need_bytes: int) -> float:
-    if global_bytes <= 0:
-        return 100.0
-    return max(0.0, min(100.0, 100.0 * (global_bytes - need_bytes) / global_bytes))
+def build_overview(hosts: list[HostSnapshot], now: datetime | None = None) -> Overview:
+    reachable = [h for h in hosts if h.reachable]
+    host_ids = _host_ids(hosts)
+    host_of = {host_ids[h.name]: h for h in hosts if h.name in host_ids}  # device ID -> its host
+
+    devices = _devices(hosts, reachable, host_ids)
+    folders = _folders(reachable, devices)
+
+    ordered = [devices[host_ids[h.name]] for h in hosts if h.name in host_ids]
+    ordered += sorted((d for d in devices.values() if not d.monitored), key=lambda d: d.name.casefold())
+    order = {d.id: i for i, d in enumerate(ordered)}
+    for folder in folders.values():
+        folder.devices.sort(key=order.__getitem__)
+    for dev in ordered:
+        dev.folder_count = sum(dev.id in f.devices for f in folders.values())
+
+    cells = {
+        (f.id, dev_id): _cell(f.id, devices[dev_id], host_of, reachable)
+        for f in folders.values()
+        for dev_id in f.devices
+    }
+    return Overview(
+        generated_at=now or datetime.now(timezone.utc),
+        hosts=hosts,
+        devices=ordered,
+        edges=_edges(reachable, host_of, folders, order),
+        folders=sorted(folders.values(), key=lambda f: f.label.casefold()),
+        cells=cells,
+        unplaced_hosts=[h.name for h in hosts if h.name not in host_ids],
+    )
 
 
-def _resolve_host_ids(hosts: list[HostSnapshot]) -> dict[str, str]:
-    """Map host name -> device ID. Unreachable hosts are matched by their configured name."""
-    ids: dict[str, str] = {}
-    for h in hosts:
-        if h.reachable and h.my_id:
-            ids[h.name] = h.my_id
+# --- building blocks ----------------------------------------------------------
+
+
+def _host_ids(hosts: list[HostSnapshot]) -> dict[str, str]:
+    """Host name -> device ID.
+
+    A reachable host reports its own ID. An unreachable one is matched by a
+    device of the same name (case-insensitive) in any other host's device list.
+    A host that matches neither way is left out and reported as unplaced.
+    """
+    ids = {h.name: h.my_id for h in hosts if h.reachable and h.my_id}
     for h in hosts:
         if h.name in ids:
             continue
         wanted = h.name.casefold()
         for other in hosts:
-            for dev_id, dev in other.devices.items():
-                if dev_id in ids.values():
-                    continue
-                if str(dev.get("name", "")).casefold() == wanted:
-                    ids[h.name] = dev_id
-                    break
-            if h.name in ids:
+            match = next(
+                (dev_id for dev_id, dev in other.devices.items()
+                 if dev_id not in ids.values() and str(dev.get("name", "")).casefold() == wanted),
+                None,
+            )
+            if match:
+                ids[h.name] = match
                 break
     return ids
 
 
-def build_overview(hosts: list[HostSnapshot], now: datetime | None = None) -> Overview:
-    now = now or datetime.now(timezone.utc)
-    reachable = [h for h in hosts if h.reachable]
-    host_ids = _resolve_host_ids(hosts)
-    id_to_host = {dev_id: name for name, dev_id in host_ids.items()}
-    host_by_name = {h.name: h for h in hosts}
-
-    # --- devices ---------------------------------------------------------
-    devices: dict[str, Device] = {}
-    for h in hosts:
-        dev_id = host_ids.get(h.name)
-        if dev_id is None:
-            continue
-        devices[dev_id] = Device(
-            id=dev_id,
-            name=h.name,
-            monitored=True,
-            reachable=h.reachable,
-            host_name=h.name,
-            version=h.version,
-            error=h.error,
+def _devices(hosts: list[HostSnapshot], reachable: list[HostSnapshot], host_ids: dict[str, str]) -> dict[str, Device]:
+    """Device ID -> Device: the monitored hosts first, then everything the reachable hosts list."""
+    devices = {
+        host_ids[h.name]: Device(
+            id=host_ids[h.name], name=h.name, monitored=True, reachable=h.reachable,
+            host_name=h.name, url=h.url, version=h.version, error=h.error,
         )
-    names: dict[str, Counter[str]] = {}
-    paused_votes: dict[str, list[bool]] = {}
+        for h in hosts
+        if h.name in host_ids
+    }
+    names: dict[str, Counter[str]] = {}  # unmonitored device ID -> names used for it, by frequency
+    paused: dict[str, list[bool]] = {}
     for h in reachable:
         for dev_id, dev in h.devices.items():
-            if dev_id == h.my_id:
+            if dev_id == h.my_id or dev_id in devices and devices[dev_id].monitored:
                 continue
+            devices.setdefault(dev_id, Device(id=dev_id, name="", monitored=False))
             names.setdefault(dev_id, Counter())[str(dev.get("name") or dev_id[:7])] += 1
-            paused_votes.setdefault(dev_id, []).append(bool(dev.get("paused")))
-            if dev_id not in devices:
-                devices[dev_id] = Device(id=dev_id, name="", monitored=False)
+            paused.setdefault(dev_id, []).append(bool(dev.get("paused")))
     for dev_id, dev in devices.items():
         if not dev.monitored:
-            dev.name = names[dev_id].most_common(1)[0][0] if dev_id in names else dev_id[:7]
-            votes = paused_votes.get(dev_id, [])
-            dev.paused = bool(votes) and all(votes)
+            dev.name = names[dev_id].most_common(1)[0][0]
+            dev.paused = all(paused[dev_id])
         for h in reachable:
-            conn = h.connections.get(dev_id)
-            if conn and conn.get("connected"):
+            conn = h.connections.get(dev_id, {})
+            if conn.get("connected"):
                 dev.connected = True
-                if not dev.monitored and conn.get("clientVersion"):
-                    dev.version = conn["clientVersion"]
+                if not dev.monitored:
+                    dev.version = conn.get("clientVersion") or dev.version
+    return devices
 
-    # --- folders ---------------------------------------------------------
+
+def _folders(reachable: list[HostSnapshot], devices: dict[str, Device]) -> dict[str, Folder]:
+    """Folder ID -> Folder with every device that has it or was offered it (unordered)."""
     folders: dict[str, Folder] = {}
-    shared_with: dict[str, set[str]] = {}  # folder ID -> device IDs that have it or are offered it
     for h in reachable:
         for folder_id, f in h.folders.items():
             folder = folders.setdefault(folder_id, Folder(id=folder_id, label=f["label"], type=f["type"]))
-            if folder.label == folder_id and f["label"] != folder_id:
+            if folder.label == folder_id and f["label"] != folder_id:  # a later host knows a nicer label
                 folder.label = f["label"]
-            members = shared_with.setdefault(folder_id, set())
-            members.add(h.my_id)
-            members.update(f["devices"])
-    for folder_id, members in shared_with.items():
-        for dev_id in members:
-            if dev_id not in devices:
-                devices[dev_id] = Device(id=dev_id, name=dev_id[:7], monitored=False)
+            for dev_id in [h.my_id, *f["devices"]]:
+                if dev_id not in folder.devices:
+                    folder.devices.append(dev_id)
+                devices.setdefault(dev_id, Device(id=dev_id, name=dev_id[:7], monitored=False))
+    return folders
 
-    # page order: monitored hosts in configuration order, then the rest by name
-    ordered: list[Device] = []
-    for h in hosts:
-        dev_id = host_ids.get(h.name)
-        if dev_id is not None:
-            ordered.append(devices[dev_id])
-    ordered.extend(sorted((d for d in devices.values() if not d.monitored), key=lambda d: d.name.casefold()))
-    order_index = {d.id: i for i, d in enumerate(ordered)}
-    for folder in folders.values():
-        folder.devices = sorted(shared_with[folder.id], key=order_index.__getitem__)
-    for dev in ordered:
-        dev.folder_count = sum(1 for f in folders.values() if dev.id in f.devices)
 
-    # --- cells -------------------------------------------------------------
-    cells: dict[tuple[str, str], Cell] = {}
-    for folder in sorted(folders.values(), key=lambda f: f.label.casefold()):
-        for dev_id in folder.devices:
-            dev = devices[dev_id]
-            cells[(folder.id, dev_id)] = _cell(folder.id, dev, id_to_host, host_by_name, reachable)
+def _edges(
+    reachable: list[HostSnapshot], host_of: dict[str, HostSnapshot], folders: dict[str, Folder], order: dict[str, int]
+) -> list[Edge]:
+    """One edge per pair of devices for which a reachable host declares a shared folder.
 
-    # --- edges -------------------------------------------------------------
-    # An edge exists where a reachable host declares that it shares a folder with a device.
-    # Two unmonitored devices never get an edge: no host can tell whether they share anything.
+    Two unmonitored devices never get an edge: no host can say whether they share anything.
+    """
     pairs: dict[tuple[str, str], list[str]] = {}
     for h in reachable:
         for folder_id, f in h.folders.items():
             for dev_id in f["devices"]:
                 if dev_id == h.my_id:
                     continue
-                key = tuple(sorted((h.my_id, dev_id), key=order_index.__getitem__))
-                folder_ids = pairs.setdefault(key, [])
-                if folder_id not in folder_ids:
-                    folder_ids.append(folder_id)
-    edges = [
-        Edge(a, b, sorted(fids, key=lambda i: folders[i].label.casefold()), _edge_state(a, b, devices, id_to_host, host_by_name))
-        for (a, b), fids in pairs.items()
+                a, b = sorted((h.my_id, dev_id), key=order.__getitem__)
+                shared = pairs.setdefault((a, b), [])
+                if folder_id not in shared:
+                    shared.append(folder_id)
+    return [
+        Edge(a, b, sorted(ids, key=lambda i: folders[i].label.casefold()), _edge_state(a, b, host_of))
+        for (a, b), ids in pairs.items()
     ]
 
-    unplaced = [h.name for h in hosts if h.name not in host_ids]
-    return Overview(
-        generated_at=now,
-        hosts=hosts,
-        devices=ordered,
-        edges=edges,
-        folders=sorted(folders.values(), key=lambda f: f.label.casefold()),
-        cells=cells,
-        unplaced_hosts=unplaced,
-    )
 
-
-def _edge_state(
-    a: str,
-    b: str,
-    devices: dict[str, Device],
-    id_to_host: dict[str, str],
-    host_by_name: dict[str, HostSnapshot],
-) -> str:
-    verdicts: list[str] = []
+def _edge_state(a: str, b: str, host_of: dict[str, HostSnapshot]) -> str:
+    """Connection state between two devices, from whichever of them is a reachable host."""
+    verdicts = []
     for me, other in ((a, b), (b, a)):
-        host = host_by_name.get(id_to_host.get(me, ""))
+        host = host_of.get(me)
         if host is None or not host.reachable:
             continue
         conn = host.connections.get(other, {})
@@ -256,69 +243,73 @@ def _edge_state(
             verdicts.append("paused")
         else:
             verdicts.append("disconnected")
-    if not verdicts:
-        return "unknown"
-    if "connected" in verdicts:
-        return "connected"
-    if "paused" in verdicts:
-        return "paused"
-    return "disconnected"
+    return next((s for s in ("connected", "paused", "disconnected") if s in verdicts), "unknown")
 
 
-def _cell(
-    folder_id: str,
-    dev: Device,
-    id_to_host: dict[str, str],
-    host_by_name: dict[str, HostSnapshot],
-    reachable: list[HostSnapshot],
-) -> Cell:
-    host = host_by_name.get(dev.host_name or "") if dev.monitored else None
+def _percent(status: FolderStatus) -> float:
+    if status.global_bytes <= 0:
+        return 100.0
+    done = status.global_bytes - status.need_bytes
+    return max(0.0, min(100.0, 100.0 * done / status.global_bytes))
 
+
+def _cell(folder_id: str, dev: Device, host_of: dict[str, HostSnapshot], reachable: list[HostSnapshot]) -> Cell:
+    """The matrix cell for one folder on one device."""
+    host = host_of.get(dev.id)
     if host is not None and host.reachable:
         if folder_id in host.folders:
-            st = host.folder_status.get(folder_id)
-            if st is None:
-                return Cell("unknown", "unknown")
-            if st.error or st.errors:
-                detail = st.error or f"{st.errors} failed items"
-                return Cell("error", "error", _percent(st.global_bytes, st.need_bytes), st.need_items, detail)
-            category = _STATE_CATEGORY.get(st.state, "unknown")
-            state = st.state
-            if st.state == "idle" and st.need_items > 0:
-                state, category = "out of sync", "syncing"
-            return Cell(state, category, _percent(st.global_bytes, st.need_bytes), st.need_items)
-        # offered by another host, not accepted here
-        pending = host.pending_folders.get(folder_id)
-        offered_by = sorted(
-            {id_to_host.get(o, "") or o[:7] for o in (pending or {}).get("offered_by", [])}
-            or {h.name for h in reachable if folder_id in h.folders and dev.id in h.folders[folder_id]["devices"]}
-        )
-        return Cell("not accepted", "flag", detail="offered by " + ", ".join(offered_by), flagged=True)
+            return _own_cell(host.folder_status.get(folder_id))
+        return _not_accepted_cell(folder_id, dev, host, host_of, reachable)
+    return _remote_cell(folder_id, dev, reachable)
 
-    # Remote view: what the reachable hosts report about this device's copy.
+
+def _own_cell(st: FolderStatus | None) -> Cell:
+    """A reachable host's own view of its folder (``/rest/db/status``)."""
+    if st is None:
+        return Cell("unknown", "unknown")
+    if st.error or st.errors:
+        return Cell("error", "error", _percent(st), st.need_items, st.error or f"{st.errors} failed items")
+    if st.state == "idle" and st.need_items > 0:
+        return Cell("out of sync", "syncing", _percent(st), st.need_items)
+    return Cell(st.state, _STATE_CATEGORY.get(st.state, "unknown"), _percent(st), st.need_items)
+
+
+def _not_accepted_cell(
+    folder_id: str, dev: Device, host: HostSnapshot, host_of: dict[str, HostSnapshot], reachable: list[HostSnapshot]
+) -> Cell:
+    """A folder another device shares with this reachable host, which has not accepted it."""
+    pending = host.pending_folders.get(folder_id)
+    if pending:  # the host itself lists the offer
+        offered_by = {host_of[o].name if o in host_of else o[:7] for o in pending["offered_by"]}
+    else:  # fall back to the hosts that declare the share
+        offered_by = {h.name for h in reachable if dev.id in h.folders.get(folder_id, {}).get("devices", [])}
+    return Cell("not accepted", "flag", detail="offered by " + ", ".join(sorted(offered_by)), flagged=True)
+
+
+def _remote_cell(folder_id: str, dev: Device, reachable: list[HostSnapshot]) -> Cell:
+    """What the reachable hosts report about this device's copy (``/rest/db/completion``).
+
+    Used for unmonitored devices and for unreachable hosts. The report of a host
+    that is connected to the device wins over a stale one.
+    """
     reports = []
     for h in reachable:
         c = h.completion.get((folder_id, dev.id))
-        if c is None:
-            continue
-        connected = bool(h.connections.get(dev.id, {}).get("connected"))
-        reports.append((connected, c, h.name))
-    if dev.monitored and not reports:
-        return Cell("unreachable", "offline", detail=dev.error)
+        if c is not None:
+            connected = bool(h.connections.get(dev.id, {}).get("connected"))
+            reports.append((connected, c.remote_state == "valid", c, h.name))
     if not reports:
+        if dev.monitored:
+            return Cell("unreachable", "offline", detail=dev.error)
         return Cell("unknown", "unknown", detail="no host reports about this device")
-    reports.sort(key=lambda r: (r[0], r[1].remote_state == "valid"), reverse=True)
-    connected, c, via = reports[0]
-    detail = f"as seen by {via}"
-    if dev.monitored:
-        detail = f"host unreachable; {detail}"
+    connected, _, c, via = max(reports, key=lambda r: r[:2])
+    detail = f"host unreachable; as seen by {via}" if dev.monitored else f"as seen by {via}"
     if c.remote_state == "notSharing":
-        return Cell("not sharing", "flag", detail=f"device does not share this folder back ({detail})", flagged=False)
+        return Cell("not sharing", "flag", detail=f"device does not share this folder back ({detail})")
     if c.remote_state == "paused":
         return Cell("paused", "paused", c.completion, c.need_items, detail)
     if not connected:
-        state = "unreachable" if dev.monitored else "offline"
-        return Cell(state, "offline", c.completion, c.need_items, f"last known, {detail}")
+        return Cell("unreachable" if dev.monitored else "offline", "offline", c.completion, c.need_items, f"last known, {detail}")
     if c.completion >= 100.0 and c.need_items == 0:
         return Cell("in sync", "ok", 100.0, 0, detail)
     return Cell("syncing", "syncing", c.completion, c.need_items, detail)
