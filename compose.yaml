@@ -1,0 +1,24 @@
+# Example stack. hosts.toml names the key files as /run/secrets/<name>;
+# compose mounts each secret there.
+services:
+  syncthing-dashboard:
+    build: .
+    # image: ghcr.io/finestream/syncthing-dashboard:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./hosts.toml:/config/hosts.toml:ro
+      # private CA for HTTPS GUIs, if hosts.toml sets ca_file
+      - ./private-ca.pem:/etc/ssl/certs/private-ca.pem:ro
+    secrets:
+      - syncthing_nas
+      - syncthing_laptop
+    command: ["--config", "/config/hosts.toml", "--serve", "8080", "--refresh", "30"]
+
+secrets:
+  # one file per host, containing only the API key
+  syncthing_nas:
+    file: ./secrets/syncthing_nas
+  syncthing_laptop:
+    file: ./secrets/syncthing_laptop

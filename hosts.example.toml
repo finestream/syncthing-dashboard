@@ -1,0 +1,31 @@
+# Copy to hosts.toml and adjust. hosts.toml is ignored by git.
+#
+# One [[hosts]] entry per Syncthing instance you want on the page.
+#   name          label on the page; also used to recognise the host in other
+#                 hosts' device lists when it is unreachable (name the device the
+#                 same way on its peers)
+#   url           the GUI/REST address, as you open it in the browser
+#   api_key_file  file holding the API key (Actions › Settings › General in the
+#                 Syncthing GUI). Relative paths are resolved against this file.
+#   ca_file       optional: PEM bundle of the private CA that signed the GUI
+#                 certificate, for HTTPS GUIs
+#
+# Never put the key itself here. The file layout matches compose secrets
+# (/run/secrets/<name>) and systemd credentials (/run/credentials/<unit>/<name>).
+
+[[hosts]]
+name = "nas"
+url = "https://nas.example.internal:8384"
+api_key_file = "/run/secrets/syncthing_nas"
+ca_file = "/etc/ssl/certs/private-ca.pem"
+
+[[hosts]]
+name = "laptop"
+url = "http://192.0.2.10:8384"
+api_key_file = "/run/secrets/syncthing_laptop"
+
+[[hosts]]
+name = "pi"
+url = "https://pi.example.internal:8384"
+api_key_file = "secrets/pi"           # relative to this file
+ca_file = "/etc/ssl/certs/private-ca.pem"
