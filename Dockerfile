@@ -12,7 +12,9 @@ USER dashboard
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
+# A reverse proxy that waits for a healthy container serves nothing until the first
+# check passes. During --start-period the checks run every --start-interval (default 5 s).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --start-interval=1s \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"
 
 ENTRYPOINT ["python", "-m", "syncthing_dashboard"]

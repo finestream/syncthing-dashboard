@@ -1,7 +1,8 @@
 import re
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from syncthing_dashboard.collector import HostSnapshot
 from syncthing_dashboard.model import build_overview
 from syncthing_dashboard.render import render
 from tests import fixtures as fx
@@ -68,6 +69,42 @@ class RenderTest(unittest.TestCase):
         self.assertIn("No devices known", html)
         self.assertIn("No folders known", html)
         self.assertIn("not shown in the graph or matrix: pi", html)
+
+    def test_contacting_host(self):
+        hosts = fx.all_hosts()
+        hosts[2] = HostSnapshot(name="pi", url=hosts[2].url, contacting=True)
+        html = render(build_overview(hosts), refresh=30)
+        self.assertIn('<span class="badge contacting">contacting server…</span>', html)
+        self.assertIn('<div class="host contacting">', html)
+        self.assertNotIn('class="badge error"', html)
+        self.assertIn("contacting 1 of 3 servers…", html)
+        self.assertIn('<meta http-equiv="refresh" content="2">', html)
+        self.assertNotIn('content="30"', html)
+
+    def test_reload_while_contacting_even_without_timed_refresh(self):
+        html = render(build_overview([HostSnapshot(name="pi", url="http://pi", contacting=True)]))
+        self.assertIn('<meta http-equiv="refresh" content="2">', html)
+        self.assertIn("Waiting for the servers to answer…", html)
+        self.assertNotIn("No devices known", html)
+        self.assertNotIn("not shown in the graph", html)
+
+    def test_old_data_stays_visible_while_contacting(self):
+        hosts = fx.all_hosts()
+        hosts[0].contacting = True
+        html = render(build_overview(hosts))
+        self.assertIn('<span class="badge ok">reachable</span>', html)
+        self.assertIn('<div class="host-contacting">contacting server…</div>', html)
+        self.assertIn('<meta http-equiv="refresh" content="2">', html)
+
+    def test_age_of_the_data(self):
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        hosts = fx.all_hosts()
+        hosts[0].polled_at = now - timedelta(seconds=12)
+        hosts[1].polled_at = now - timedelta(minutes=5)
+        html = render(build_overview(hosts, now=now))
+        self.assertIn("<dt>Updated</dt><dd>12 s ago</dd>", html)
+        self.assertIn("<dt>Updated</dt><dd>5 min ago</dd>", html)
+        self.assertNotIn("<dt>Updated</dt>", self.html)  # one-shot page: no poller, no age
 
 
 if __name__ == "__main__":

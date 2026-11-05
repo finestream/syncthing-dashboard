@@ -13,9 +13,12 @@ from . import __version__
 from .collector import collect_all
 from .config import ConfigError, HostConfig, load_hosts
 from .model import build_overview
+from .poller import Poller
 from .render import render
 
 log = logging.getLogger("syncthing_dashboard")
+
+DEFAULT_MAX_AGE = 30  # seconds between polls of a host when the page has no timed refresh
 
 
 def build_page(hosts: list[HostConfig], timeout: float, refresh: int | None, title: str) -> str:
@@ -41,7 +44,7 @@ class Server(ThreadingHTTPServer):
         self.server_port = int(port)
 
 
-def make_handler(hosts: list[HostConfig], timeout: float, refresh: int | None, title: str):
+def make_handler(poller: Poller, refresh: int | None, title: str):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"syncthing-dashboard/{__version__}"
 
@@ -54,7 +57,8 @@ def make_handler(hosts: list[HostConfig], timeout: float, refresh: int | None, t
                 self._send(404, b"not found\n", "text/plain; charset=utf-8")
                 return
             try:
-                body = build_page(hosts, timeout, refresh, title).encode("utf-8")
+                poller.poll_due()
+                body = render(build_overview(poller.snapshots()), refresh=refresh, title=title).encode("utf-8")
             except Exception:  # the page must never die with a traceback on screen
                 log.exception("rendering failed")
                 self._send(500, b"rendering failed, see server log\n", "text/plain; charset=utf-8")
@@ -88,7 +92,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-c", "--config", default="hosts.toml", help="hosts file (default: hosts.toml)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--out", metavar="FILE", help="write the page once to FILE ('-' for stdout)")
-    mode.add_argument("--serve", metavar="PORT", type=int, help="serve the page on PORT, regenerated per request")
+    mode.add_argument("--serve", metavar="PORT", type=int, help="serve the page on PORT, hosts polled in the background")
     parser.add_argument("--bind", default="0.0.0.0", help="address to bind with --serve (default: 0.0.0.0)")
     parser.add_argument("--refresh", type=int, default=30, help="meta refresh in seconds with --serve (0 = none, default: 30)")
     parser.add_argument("--timeout", type=float, default=5.0, help="seconds per REST call (default: 5)")
@@ -120,7 +124,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     refresh = args.refresh if args.refresh > 0 else None
-    server = Server((args.bind, args.serve), make_handler(hosts, args.timeout, refresh, args.title))
+    poller = Poller(hosts, timeout=args.timeout, max_age=refresh or DEFAULT_MAX_AGE)
+    server = Server((args.bind, args.serve), make_handler(poller, refresh, args.title))
+    poller.poll_due()  # the first visitor should find answers waiting
     log.warning("serving on http://%s:%d/ for %d host(s)", args.bind, args.serve, len(hosts))
     try:
         server.serve_forever()

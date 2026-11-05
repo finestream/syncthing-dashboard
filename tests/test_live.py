@@ -5,12 +5,14 @@ rendered page to ``tests/live/run/overview.html`` so it can be opened in a brows
 """
 
 import json
+import time
 import unittest
 from pathlib import Path
 
 from syncthing_dashboard.collector import collect_all
 from syncthing_dashboard.config import load_hosts
 from syncthing_dashboard.model import build_overview
+from syncthing_dashboard.poller import Poller
 from syncthing_dashboard.render import render
 
 RUN = Path(__file__).resolve().parent / "live" / "run"
@@ -80,6 +82,17 @@ class LiveTest(unittest.TestCase):
         self.assertNotIn("<script", self.html)
         for host in self.hosts:
             self.assertNotIn(host.api_key, self.html)
+
+    def test_background_poller(self):
+        poller = Poller(self.hosts, timeout=5)
+        poller.poll_due()
+        deadline = time.monotonic() + 30
+        while any(s.contacting for s in poller.snapshots()) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        by_name = {s.name: s for s in poller.snapshots()}
+        self.assertFalse(any(s.contacting for s in by_name.values()))
+        self.assertTrue(by_name["alpha"].reachable)
+        self.assertFalse(by_name["gamma"].reachable)
 
 
 if __name__ == "__main__":

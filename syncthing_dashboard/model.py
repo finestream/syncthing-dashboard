@@ -41,10 +41,13 @@ class Device:
     connected: bool = False  # at least one reachable host is connected to it
     paused: bool = False  # paused on every reachable host that knows it
     error: str = ""  # why the host is unreachable
+    contacting: bool = False  # monitored device whose host has not answered yet
     folder_count: int = 0
 
     @property
     def category(self) -> str:
+        if self.contacting:
+            return "unknown"
         if self.monitored:
             return "ok" if self.reachable else "error"
         if self.paused:
@@ -53,6 +56,8 @@ class Device:
 
     @property
     def status_text(self) -> str:
+        if self.contacting:
+            return "contacting server…"
         if self.monitored:
             return "reachable" if self.reachable else "unreachable"
         if self.paused:
@@ -128,7 +133,7 @@ def build_overview(hosts: list[HostSnapshot], now: datetime | None = None) -> Ov
         edges=_edges(reachable, host_of, folders, order),
         folders=sorted(folders.values(), key=lambda f: f.label.casefold()),
         cells=cells,
-        unplaced_hosts=[h.name for h in hosts if h.name not in host_ids],
+        unplaced_hosts=[h.name for h in hosts if h.name not in host_ids and not h.awaiting_answer],
     )
 
 
@@ -164,7 +169,7 @@ def _devices(hosts: list[HostSnapshot], reachable: list[HostSnapshot], host_ids:
     devices = {
         host_ids[h.name]: Device(
             id=host_ids[h.name], name=h.name, monitored=True, reachable=h.reachable,
-            host_name=h.name, url=h.url, version=h.version, error=h.error,
+            host_name=h.name, url=h.url, version=h.version, error=h.error, contacting=h.awaiting_answer,
         )
         for h in hosts
         if h.name in host_ids
@@ -255,6 +260,8 @@ def _percent(status: FolderStatus) -> float:
 
 def _cell(folder_id: str, dev: Device, host_of: dict[str, HostSnapshot], reachable: list[HostSnapshot]) -> Cell:
     """The matrix cell for one folder on one device."""
+    if dev.contacting:
+        return Cell("contacting server…", "unknown", detail="waiting for this host to answer")
     host = host_of.get(dev.id)
     if host is not None and host.reachable:
         if folder_id in host.folders:
