@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from syncthing_dashboard.collector import FolderStatus
+from syncthing_dashboard.collector import FolderStatus, HostSnapshot
 from syncthing_dashboard.model import build_overview
 from tests import fixtures as fx
 
@@ -112,6 +112,27 @@ class BuildOverviewTest(unittest.TestCase):
         self.assertEqual(ov.devices, [])
         self.assertEqual(ov.folders, [])
         self.assertEqual(ov.unplaced_hosts, ["pi"])
+
+    def test_host_being_contacted_is_not_called_unreachable(self):
+        hosts = fx.all_hosts()
+        hosts[2] = HostSnapshot(name="pi", url=hosts[2].url, contacting=True)
+        ov = build_overview(hosts)
+        pi = ov.device(fx.PI)
+        self.assertEqual((pi.category, pi.status_text), ("unknown", "contacting server…"))
+        cell = ov.cells[("docs", fx.PI)]
+        self.assertEqual((cell.state, cell.category, cell.completion), ("contacting server…", "unknown", None))
+        self.assertEqual(ov.device(fx.NAS).category, "ok")
+
+    def test_host_being_contacted_is_not_reported_as_unplaced(self):
+        ov = build_overview([HostSnapshot(name="pi", url="http://pi", contacting=True)])
+        self.assertEqual(ov.unplaced_hosts, [])
+
+    def test_host_with_old_data_keeps_it_while_being_contacted(self):
+        hosts = fx.all_hosts()
+        hosts[0].contacting = True
+        ov = build_overview(hosts)
+        self.assertEqual(ov.device(fx.NAS).category, "ok")
+        self.assertEqual(ov.cells[("docs", fx.NAS)].state, "idle")
 
 
 if __name__ == "__main__":

@@ -80,11 +80,14 @@ never breaks the page; its cells show what its peers last knew about it.
 
    ```sh
    python3 -m syncthing_dashboard --out overview.html          # for cron
-   python3 -m syncthing_dashboard --serve 8080                 # regenerates on every request
+   python3 -m syncthing_dashboard --serve 8080                 # polls in the background
    ```
 
-   `--serve` adds a meta refresh of 30 s (`--refresh 0` disables it) and
-   answers `/healthz` with `ok`. Other options: `--config`, `--bind`,
+   `--serve` answers at once and shows *contacting server…* for each host
+   that has not answered yet; while it does, the page reloads every 2 s, so
+   hosts appear as their answers arrive. After that it uses a meta refresh of
+   30 s (`--refresh 0` disables the timed one). It answers `/healthz` with
+   `ok`. Other options: `--config`, `--bind`,
    `--timeout` (seconds per REST call, default 5), `--title`, `--verbose`.
 
 `hosts.toml`, `*.pem` and `secrets/` are in `.gitignore`.
@@ -154,7 +157,15 @@ docker compose up -d
 
 ## How it works
 
-Per host, with a timeout and in parallel across hosts:
+With `--serve`, polling is separate from serving. Each host is polled in its
+own thread, so a slow or dead host holds up only its own card, and the page is
+rendered from the latest answers. A host is polled at the start and then when
+a page request finds its data older than the refresh interval: Syncthing calls
+`/rest/db/status` expensive, so nothing is polled while nobody looks. A page
+opened after such a pause shows the old data, marked *contacting server…*,
+until the new answers are in.
+
+Per host, with a timeout, one call at a time:
 
 | Endpoint                                 | Used for                                   |
 | ---------------------------------------- | ------------------------------------------ |

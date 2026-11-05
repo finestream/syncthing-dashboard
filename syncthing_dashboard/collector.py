@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from .config import HostConfig
@@ -65,6 +66,13 @@ class HostSnapshot:
     # folders offered by other devices and not accepted here: folder ID -> {"label", "offered_by": [ids]}
     pending_folders: dict[str, dict[str, Any]] = field(default_factory=dict)
     system_errors: int = 0
+    polled_at: datetime | None = None  # set by the background poller
+    contacting: bool = False  # a poll is running and this data, if any, is out of date
+
+    @property
+    def awaiting_answer(self) -> bool:
+        """Being contacted, with nothing usable to show until it answers."""
+        return self.contacting and not self.reachable
 
     @property
     def connected_peers(self) -> int:

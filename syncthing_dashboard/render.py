@@ -5,6 +5,9 @@ Inline CSS, inline SVG, no scripts, no external resources. Hover texts use
 variables named after the state categories of :mod:`.model` (``ok``,
 ``syncing``, ``scanning``, ``error``, ``paused``, ``offline``, ``flag``,
 ``unknown``), so a category maps to a class name everywhere.
+
+While a host is being contacted the page reloads itself every few seconds, so
+hosts appear as their answers arrive.
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from html import escape
 
 from . import __version__
 from .model import Cell, Device, Overview
+
+CONTACTING_REFRESH = 2  # seconds between reloads while a host is being contacted
 
 # Specificity matters: ``.matrix td`` (one class, one element) sets the generic border, so
 # the cell rules carry two classes (``.matrix .cell``) and the state rules three
@@ -41,6 +46,8 @@ h2 { font-size: 1.05rem; margin: 2rem 0 .75rem; }
 .host { background: var(--card); border-radius: 10px; padding: .75rem 1rem; min-width: 14rem; border-left: 6px solid var(--unknown); }
 .host.ok { border-left-color: var(--ok); }
 .host.error { border-left-color: var(--error); }
+.host.contacting { border-left-color: var(--syncing); }
+.host-contacting { color: var(--syncing); font-size: .85rem; margin-top: .4rem; }
 .host-name { font-weight: 600; font-size: 1.05rem; }
 .host-name a { text-decoration: none; }
 .host-name a:hover { text-decoration: underline; }
@@ -52,6 +59,7 @@ h2 { font-size: 1.05rem; margin: 2rem 0 .75rem; }
 .badge.ok { background: var(--ok); }
 .badge.error { background: var(--error); }
 .badge.flag { background: var(--flag); }
+.badge.contacting { background: var(--syncing); }
 
 /* topology */
 .topology { max-width: 100%; overflow: auto; background: var(--card); border-radius: 10px; }
@@ -111,6 +119,11 @@ def _percent(value: float) -> str:
     return f"{value:.0f}%" if abs(value - round(value)) < 0.05 else f"{value:.1f}%"
 
 
+def _age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds} s ago" if seconds < 120 else f"{seconds // 60} min ago"
+
+
 def _gui_link(url: str, text: str) -> str:
     """Link to a host's Syncthing GUI; the API key cannot log the browser in, so it is a plain link."""
     return f'<a href="{escape(url, quote=True)}" title="Open the Syncthing GUI">{text}</a>'
@@ -123,12 +136,21 @@ def _device_heading(d: Device) -> str:
     return f'{name}<span class="sub">{kind} · {escape(d.status_text)}</span>'
 
 
+def _nothing_yet(ov: Overview, when_done: str) -> str:
+    """Text for an empty section: an empty page is only final once every host has answered."""
+    return "Waiting for the servers to answer…" if any(h.awaiting_answer for h in ov.hosts) else when_done
+
+
 # --- sections -----------------------------------------------------------------
 
 
 def _host_strip(ov: Overview) -> str:
     parts = ['<div class="hosts">']
     for h in ov.hosts:
+        if h.awaiting_answer:
+            badge = '<span class="badge contacting">contacting server…</span>'
+            parts.append(f'<div class="host contacting"><div class="host-name">{_gui_link(h.url, escape(h.name) + " " + badge)}</div></div>')
+            continue
         cls = "ok" if h.reachable else "error"
         badge = f'<span class="badge {cls}">{"reachable" if h.reachable else "unreachable"}</span>'
         parts.append(f'<div class="host {cls}"><div class="host-name">{_gui_link(h.url, escape(h.name) + " " + badge)}</div>')
@@ -141,10 +163,14 @@ def _host_strip(ov: Overview) -> str:
                 ("Folders", str(len(h.folders))),
                 ("Errors", f'{errors} <span class="badge error">!</span>' if errors else "0"),
             ]
+            if h.polled_at:
+                rows.append(("Updated", _age((ov.generated_at - h.polled_at).total_seconds())))
             if h.pending_folders:
                 labels = ", ".join(escape(p["label"]) for p in h.pending_folders.values())
                 rows.append(("Offered", f'<span class="badge flag">{len(h.pending_folders)}</span> {labels}'))
             parts.append("<dl>" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows) + "</dl>")
+            if h.contacting:
+                parts.append('<div class="host-contacting">contacting server…</div>')
         else:
             parts.append(f'<div class="host-error">{escape(h.error or "no answer")}</div>')
         parts.append("</div>")
@@ -162,7 +188,7 @@ def _topology(ov: Overview) -> str:
     devices = ov.devices
     n = len(devices)
     if n == 0:
-        return '<p class="meta">No devices known.</p>'
+        return f'<p class="meta">{_nothing_yet(ov, "No devices known.")}</p>'
     radius = max(120, 34 * n)
     cx, cy = radius + 190, radius + 80  # margins for the labels
     angle = {d.id: -math.pi / 2 + 2 * math.pi * i / n for i, d in enumerate(devices)}
@@ -221,7 +247,7 @@ def _cell_html(cell: Cell | None) -> str:
 
 def _matrix(ov: Overview) -> str:
     if not ov.folders:
-        return '<p class="meta">No folders known.</p>'
+        return f'<p class="meta">{_nothing_yet(ov, "No folders known.")}</p>'
     head = "".join(f"<th>{_device_heading(d)}</th>" for d in ov.devices)
     rows = []
     for f in ov.folders:
@@ -236,11 +262,18 @@ def _legend() -> str:
 
 
 def render(ov: Overview, refresh: int | None = None, title: str = "Syncthing overview") -> str:
-    """Return the complete HTML document; ``refresh`` adds a meta refresh in seconds."""
+    """Return the complete HTML document; ``refresh`` adds a meta refresh in seconds.
+
+    While a host is being contacted the page reloads sooner, whatever ``refresh`` says.
+    """
+    contacting = sum(1 for h in ov.hosts if h.contacting)
+    if contacting:
+        refresh = CONTACTING_REFRESH
     refresh_tag = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
     generated = ov.generated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     reachable = sum(1 for h in ov.hosts if h.reachable)
     monitored = sum(1 for d in ov.devices if d.monitored)
+    contacting_note = f" · contacting {contacting} of {len(ov.hosts)} servers…" if contacting else ""
     warn = ""
     if ov.unplaced_hosts:
         names = ", ".join(escape(n) for n in ov.unplaced_hosts)
@@ -259,7 +292,7 @@ def render(ov: Overview, refresh: int | None = None, title: str = "Syncthing ove
 </head>
 <body>
 <h1>{escape(title)}</h1>
-<div class="meta">Generated {escape(generated)} · {reachable} of {len(ov.hosts)} hosts reachable · {len(ov.devices)} devices ({monitored} monitored) · {len(ov.folders)} folders</div>
+<div class="meta">Generated {escape(generated)} · {reachable} of {len(ov.hosts)} hosts reachable · {len(ov.devices)} devices ({monitored} monitored) · {len(ov.folders)} folders{contacting_note}</div>
 {_host_strip(ov)}
 {warn}
 <h2>Topology</h2>
